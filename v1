@@ -1,0 +1,532 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from matplotlib.dates import DateFormatter
+import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')
+
+# Deep Learning Libraries
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+# Data fetching (you can replace with real API)
+import requests
+import time
+from datetime import datetime, timedelta
+import threading
+import queue
+
+class BitcoinLSTMPredictor:
+    def __init__(self):
+        """Initialize the Bitcoin LSTM Predictor"""
+        self.model = None
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
+        self.sequence_length = 60  # Use 60 previous minutes to predict next
+        self.data = None
+        self.scaled_data = None
+        self.predictions = []
+        self.actual_prices = []
+        self.prediction_timestamps = []
+        
+        # Live prediction settings
+        self.is_predicting = False
+        self.prediction_queue = queue.Queue()
+        
+        # Set style for better plots
+        plt.style.use('dark_background')
+        sns.set_palette("husl")
+        
+    def fetch_bitcoin_data(self, days=7):
+        """
+        Fetch Bitcoin price data from CoinGecko API
+        For demo purposes, we'll generate synthetic data that mimics real BTC behavior
+        """
+        print("🔄 Fetching Bitcoin data...")
+        
+        try:
+            # In production, use this API call:
+            # url = f"https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+            # params = {"vs_currency": "usd", "days": days, "interval": "minute"}
+            # response = requests.get(url, params=params)
+            # data = response.json()
+            
+            # For demo, generate realistic synthetic data
+            end_time = datetime.now()
+            start_time = end_time - timedelta(days=days)
+            timestamps = pd.date_range(start=start_time, end=end_time, freq='1min')
+            
+            # Generate realistic Bitcoin price data
+            np.random.seed(42)  # For reproducible results
+            base_price = 65000  # Starting price around $65k
+            
+            prices = [base_price]
+            volumes = []
+            
+            for i in range(1, len(timestamps)):
+                # Market factors simulation
+                hour = timestamps[i].hour
+                day_of_week = timestamps[i].weekday()
+                
+                # Higher volatility during US trading hours
+                volatility = 0.0008 if 9 <= hour <= 16 else 0.0005
+                
+                # Weekend effect (lower volume, higher volatility)
+                if day_of_week >= 5:  # Weekend
+                    volatility *= 1.5
+                
+                # Trend component (subtle long-term movement)
+                trend = np.sin(i / 1000) * 0.0002
+                
+                # Random walk with volatility
+                price_change = np.random.normal(trend, volatility)
+                new_price = prices[-1] * (1 + price_change)
+                
+                # Ensure price doesn't go negative
+                new_price = max(new_price, 1000)
+                prices.append(new_price)
+                
+                # Generate volume data
+                base_volume = 1000 + np.random.exponential(500)
+                volumes.append(base_volume)
+            
+            # Create DataFrame
+            self.data = pd.DataFrame({
+                'timestamp': timestamps[:len(prices)],
+                'price': prices,
+                'volume': volumes[:len(prices)]
+            })
+            
+            self.data.set_index('timestamp', inplace=True)
+            
+            print(f"✅ Successfully fetched {len(self.data)} data points")
+            print(f"📊 Price range: ${self.data['price'].min():.2f} - ${self.data['price'].max():.2f}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error fetching data: {e}")
+            return False
+    
+    def prepare_data(self, test_size=0.2):
+        """Prepare data for LSTM training"""
+        print("🔧 Preparing data for LSTM...")
+        
+        # Scale the data
+        prices = self.data['price'].values.reshape(-1, 1)
+        self.scaled_data = self.scaler.fit_transform(prices)
+        
+        # Create sequences
+        X, y = [], []
+        
+        for i in range(self.sequence_length, len(self.scaled_data)):
+            X.append(self.scaled_data[i-self.sequence_length:i, 0])
+            y.append(self.scaled_data[i, 0])
+        
+        X, y = np.array(X), np.array(y)
+        
+        # Split into train and test
+        split_idx = int(len(X) * (1 - test_size))
+        
+        self.X_train = X[:split_idx]
+        self.X_test = X[split_idx:]
+        self.y_train = y[:split_idx]
+        self.y_test = y[split_idx:]
+        
+        # Reshape for LSTM (samples, time steps, features)
+        self.X_train = self.X_train.reshape(self.X_train.shape[0], self.X_train.shape[1], 1)
+        self.X_test = self.X_test.reshape(self.X_test.shape[0], self.X_test.shape[1], 1)
+        
+        print(f"📈 Training data shape: {self.X_train.shape}")
+        print(f"📉 Test data shape: {self.X_test.shape}")
+        
+        return True
+    
+    def build_model(self):
+        """Build the LSTM model architecture"""
+        print("🏗️  Building LSTM model...")
+        
+        self.model = Sequential([
+            # First LSTM layer with return sequences
+            LSTM(units=50, return_sequences=True, 
+                 input_shape=(self.sequence_length, 1)),
+            Dropout(0.2),
+            
+            # Second LSTM layer
+            LSTM(units=50, return_sequences=True),
+            Dropout(0.2),
+            
+            # Third LSTM layer
+            LSTM(units=50, return_sequences=False),
+            Dropout(0.2),
+            
+            # Dense layers
+            Dense(units=25, activation='relu'),
+            Dense(units=1)
+        ])
+        
+        # Compile the model
+        self.model.compile(
+            optimizer=Adam(learning_rate=0.001),
+            loss='mse',
+            metrics=['mae']
+        )
+        
+        print("✅ Model architecture built successfully")
+        print(self.model.summary())
+        
+        return True
+    
+    def train_model(self, epochs=100, batch_size=32):
+        """Train the LSTM model"""
+        print(f"🧠 Training LSTM model for {epochs} epochs...")
+        
+        # Callbacks
+        early_stopping = EarlyStopping(
+            monitor='val_loss',
+            patience=15,
+            restore_best_weights=True
+        )
+        
+        reduce_lr = ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=10,
+            min_lr=0.0001
+        )
+        
+        # Train the model
+        history = self.model.fit(
+            self.X_train, self.y_train,
+            batch_size=batch_size,
+            epochs=epochs,
+            validation_data=(self.X_test, self.y_test),
+            callbacks=[early_stopping, reduce_lr],
+            verbose=1
+        )
+        
+        print("✅ Model training completed!")
+        
+        # Plot training history
+        self.plot_training_history(history)
+        
+        return history
+    
+    def plot_training_history(self, history):
+        """Plot training and validation loss"""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+        
+        # Loss plot
+        ax1.plot(history.history['loss'], label='Training Loss', color='#FF6B6B')
+        ax1.plot(history.history['val_loss'], label='Validation Loss', color='#4ECDC4')
+        ax1.set_title('Model Loss Evolution', fontsize=14, fontweight='bold')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # MAE plot
+        ax2.plot(history.history['mae'], label='Training MAE', color='#45B7D1')
+        ax2.plot(history.history['val_mae'], label='Validation MAE', color='#96CEB4')
+        ax2.set_title('Model MAE Evolution', fontsize=14, fontweight='bold')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('Mean Absolute Error')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def evaluate_model(self):
+        """Evaluate the model performance"""
+        print("📊 Evaluating model performance...")
+        
+        # Make predictions
+        train_predictions = self.model.predict(self.X_train)
+        test_predictions = self.model.predict(self.X_test)
+        
+        # Inverse transform predictions
+        train_predictions = self.scaler.inverse_transform(train_predictions)
+        test_predictions = self.scaler.inverse_transform(test_predictions)
+        
+        # Inverse transform actual values
+        y_train_actual = self.scaler.inverse_transform(self.y_train.reshape(-1, 1))
+        y_test_actual = self.scaler.inverse_transform(self.y_test.reshape(-1, 1))
+        
+        # Calculate metrics
+        train_rmse = np.sqrt(mean_squared_error(y_train_actual, train_predictions))
+        test_rmse = np.sqrt(mean_squared_error(y_test_actual, test_predictions))
+        train_mae = mean_absolute_error(y_train_actual, train_predictions)
+        test_mae = mean_absolute_error(y_test_actual, test_predictions)
+        
+        print(f"📈 Training RMSE: ${train_rmse:.2f}")
+        print(f"📉 Test RMSE: ${test_rmse:.2f}")
+        print(f"📈 Training MAE: ${train_mae:.2f}")
+        print(f"📉 Test MAE: ${test_mae:.2f}")
+        
+        # Plot predictions vs actual
+        self.plot_predictions(y_test_actual, test_predictions)
+        
+        return {
+            'train_rmse': train_rmse,
+            'test_rmse': test_rmse,
+            'train_mae': train_mae,
+            'test_mae': test_mae
+        }
+    
+    def plot_predictions(self, actual, predicted):
+        """Plot actual vs predicted prices"""
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
+        
+        # Time series plot
+        test_indices = range(len(actual))
+        ax1.plot(test_indices, actual, label='Actual Price', color='#2ECC71', linewidth=2)
+        ax1.plot(test_indices, predicted, label='Predicted Price', color='#E74C3C', linewidth=2, alpha=0.8)
+        ax1.set_title('Bitcoin Price Prediction - Test Set', fontsize=16, fontweight='bold')
+        ax1.set_xlabel('Time Steps')
+        ax1.set_ylabel('Price (USD)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Scatter plot
+        ax2.scatter(actual, predicted, alpha=0.6, color='#9B59B6')
+        ax2.plot([actual.min(), actual.max()], [actual.min(), actual.max()], 'r--', lw=2)
+        ax2.set_title('Actual vs Predicted Prices', fontsize=16, fontweight='bold')
+        ax2.set_xlabel('Actual Price (USD)')
+        ax2.set_ylabel('Predicted Price (USD)')
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def predict_next_price(self):
+        """Predict the next price based on the last sequence"""
+        if self.model is None:
+            print("❌ Model not trained yet!")
+            return None
+        
+        # Get the last sequence
+        last_sequence = self.scaled_data[-self.sequence_length:]
+        last_sequence = last_sequence.reshape(1, self.sequence_length, 1)
+        
+        # Make prediction
+        prediction_scaled = self.model.predict(last_sequence, verbose=0)
+        prediction = self.scaler.inverse_transform(prediction_scaled)
+        
+        return prediction[0][0]
+    
+    def simulate_live_trading(self, duration_minutes=30, update_interval=2):
+        """Simulate live trading with real-time predictions"""
+        print(f"🚀 Starting live prediction simulation for {duration_minutes} minutes...")
+        print(f"📊 Updates every {update_interval} seconds")
+        
+        self.predictions = []
+        self.actual_prices = []
+        self.prediction_timestamps = []
+        self.is_predicting = True
+        
+        # Setup the plot
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
+        plt.ion()  # Turn on interactive mode
+        
+        start_time = time.time()
+        last_price = self.data['price'].iloc[-1]
+        
+        try:
+            while self.is_predicting and (time.time() - start_time) < duration_minutes * 60:
+                # Simulate new price (in real app, fetch from API)
+                volatility = 0.001
+                price_change = np.random.normal(0, volatility)
+                new_price = last_price * (1 + price_change)
+                new_price = max(new_price, 1000)  # Prevent negative prices
+                
+                # Make prediction
+                predicted_price = self.predict_next_price()
+                
+                if predicted_price is not None:
+                    # Store results
+                    current_time = datetime.now()
+                    self.predictions.append(predicted_price)
+                    self.actual_prices.append(new_price)
+                    self.prediction_timestamps.append(current_time)
+                    
+                    # Update data for next prediction
+                    new_data_point = np.array([[new_price]])
+                    new_scaled = self.scaler.transform(new_data_point)
+                    self.scaled_data = np.vstack([self.scaled_data, new_scaled])
+                    
+                    # Keep only recent data to prevent memory issues
+                    if len(self.scaled_data) > 5000:
+                        self.scaled_data = self.scaled_data[-4000:]
+                    
+                    # Update plots
+                    self.update_live_plots(ax1, ax2)
+                    
+                    # Print current status
+                    accuracy = self.calculate_accuracy()
+                    print(f"🔮 Predicted: ${predicted_price:.2f} | "
+                          f"Actual: ${new_price:.2f} | "
+                          f"Error: {abs(predicted_price - new_price):.2f} | "
+                          f"Accuracy: {accuracy:.1f}%")
+                    
+                    last_price = new_price
+                
+                time.sleep(update_interval)
+                
+        except KeyboardInterrupt:
+            print("\n⏹️  Live prediction stopped by user")
+        
+        self.is_predicting = False
+        plt.ioff()  # Turn off interactive mode
+        plt.show()
+        
+        print(f"✅ Live prediction completed. Total predictions: {len(self.predictions)}")
+        return self.get_live_metrics()
+    
+    def update_live_plots(self, ax1, ax2):
+        """Update live prediction plots"""
+        if len(self.predictions) < 2:
+            return
+        
+        # Clear previous plots
+        ax1.clear()
+        ax2.clear()
+        
+        # Plot 1: Recent price evolution
+        recent_limit = min(50, len(self.predictions))
+        recent_times = self.prediction_timestamps[-recent_limit:]
+        recent_actual = self.actual_prices[-recent_limit:]
+        recent_pred = self.predictions[-recent_limit:]
+        
+        ax1.plot(recent_times, recent_actual, 'g-', label='Actual Price', linewidth=2)
+        ax1.plot(recent_times, recent_pred, 'r--', label='Predicted Price', linewidth=2, alpha=0.8)
+        ax1.set_title('🔴 LIVE: Bitcoin Price Prediction', fontsize=14, fontweight='bold')
+        ax1.set_ylabel('Price (USD)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        ax1.tick_params(axis='x', rotation=45)
+        
+        # Format x-axis
+        ax1.xaxis.set_major_formatter(DateFormatter('%H:%M:%S'))
+        
+        # Plot 2: Prediction accuracy over time
+        errors = [abs(p - a) / a * 100 for p, a in zip(self.predictions, self.actual_prices)]
+        ax2.plot(recent_times, errors[-recent_limit:], 'b-', linewidth=2)
+        ax2.set_title('📊 Prediction Error Over Time', fontsize=14, fontweight='bold')
+        ax2.set_ylabel('Error (%)')
+        ax2.set_xlabel('Time')
+        ax2.grid(True, alpha=0.3)
+        ax2.tick_params(axis='x', rotation=45)
+        ax2.xaxis.set_major_formatter(DateFormatter('%H:%M:%S'))
+        
+        plt.tight_layout()
+        plt.draw()
+        plt.pause(0.01)
+    
+    def calculate_accuracy(self):
+        """Calculate prediction accuracy (within 1% threshold)"""
+        if len(self.predictions) == 0:
+            return 0.0
+        
+        accurate_predictions = 0
+        for pred, actual in zip(self.predictions, self.actual_prices):
+            error_percentage = abs(pred - actual) / actual * 100
+            if error_percentage <= 1.0:  # Within 1%
+                accurate_predictions += 1
+        
+        return (accurate_predictions / len(self.predictions)) * 100
+    
+    def get_live_metrics(self):
+        """Get comprehensive metrics from live predictions"""
+        if len(self.predictions) == 0:
+            return {}
+        
+        predictions = np.array(self.predictions)
+        actual = np.array(self.actual_prices)
+        
+        rmse = np.sqrt(mean_squared_error(actual, predictions))
+        mae = mean_absolute_error(actual, predictions)
+        mape = np.mean(np.abs((actual - predictions) / actual)) * 100
+        accuracy = self.calculate_accuracy()
+        
+        metrics = {
+            'total_predictions': len(predictions),
+            'rmse': rmse,
+            'mae': mae,
+            'mape': mape,
+            'accuracy_1pct': accuracy,
+            'avg_actual_price': np.mean(actual),
+            'avg_predicted_price': np.mean(predictions)
+        }
+        
+        print("\n📈 LIVE PREDICTION METRICS:")
+        print("=" * 50)
+        for key, value in metrics.items():
+            if isinstance(value, float):
+                print(f"{key.upper().replace('_', ' ')}: {value:.2f}")
+            else:
+                print(f"{key.upper().replace('_', ' ')}: {value}")
+        
+        return metrics
+    
+    def save_model(self, filepath="btc_lstm_model.h5"):
+        """Save the trained model"""
+        if self.model:
+            self.model.save(filepath)
+            print(f"💾 Model saved to {filepath}")
+    
+    def load_model(self, filepath="btc_lstm_model.h5"):
+        """Load a pre-trained model"""
+        try:
+            self.model = tf.keras.models.load_model(filepath)
+            print(f"📂 Model loaded from {filepath}")
+            return True
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            return False
+
+def main():
+    """Main execution function"""
+    print("🚀 Bitcoin LSTM Price Predictor")
+    print("=" * 50)
+    
+    # Initialize predictor
+    predictor = BitcoinLSTMPredictor()
+    
+    # Step 1: Fetch data
+    if not predictor.fetch_bitcoin_data(days=7):
+        return
+    
+    # Step 2: Prepare data
+    if not predictor.prepare_data():
+        return
+    
+    # Step 3: Build model
+    if not predictor.build_model():
+        return
+    
+    # Step 4: Train model
+    history = predictor.train_model(epochs=50)
+    
+    # Step 5: Evaluate model
+    metrics = predictor.evaluate_model()
+    
+    # Step 6: Save model
+    predictor.save_model()
+    
+    # Step 7: Start live predictions
+    print("\n🔴 Starting live prediction simulation...")
+    input("Press Enter to start live predictions (Ctrl+C to stop)...")
+    
+    live_metrics = predictor.simulate_live_trading(duration_minutes=10, update_interval=1)
+    
+    print("\n✅ Bitcoin LSTM Prediction completed!")
+
+if __name__ == "__main__":
+    main()
